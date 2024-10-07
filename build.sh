@@ -21,7 +21,7 @@ help() {
 }
 
 COMMANDS="main deps clean clean-deps all"
-COMMAND=main
+COMMAND=all
 
 if [ -n "$1" ]; then
     COMMAND=$1
