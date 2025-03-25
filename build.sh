@@ -105,9 +105,7 @@ build_main() {
     
     echo "Building main program"
     cd "$BUILD_DIR" || exit
-    #$CC $CFLAGS ../main.c $INCLUDES -L$LIBS_DIR -lbpf -lelf -lz -o main
-    #temp without optimization
-    $CC -g $CFILES ../main.c $INCLUDES -L$LIBS_DIR -lbpf -lelf -lz $DEFINES -o main
+    $CC $CFLAGS $CFILES ../main.c $INCLUDES -L$LIBS_DIR -lbpf -lelf -lz $DEFINES -o main
     mv main $PROJECT_FOLDER/main
     cd "$PROJECT_FOLDER" || exit
     echo "Done"
