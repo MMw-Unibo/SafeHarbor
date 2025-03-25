@@ -13,14 +13,16 @@ usage() {
 help() {
     usage
     echo "Commands:"
-    echo "  main: build the main program"
+    echo "  main: build the main program and ebpfs programs"
+    echo "  only-main: build only the main program"
+    echo "  ebpfs: build only ebpf programs"
     echo "  deps: build dependencies"
     echo "  clean: clean the build directory"
     echo "  clean-deps: clean the dependencies directory"
     echo "  all: build all"
 }
 
-COMMANDS="main deps clean clean-deps all"
+COMMANDS="main deps clean clean-deps all ebpfs only-main"
 COMMAND=all
 
 if [ -n "$1" ]; then
@@ -48,8 +50,9 @@ LIBBPF_BUILD_DIR="$BUILD_DEPS_DIR/libbpf"
 
 # -----------------------------------------------------------------------------
 # FUNCTIONS
-# 
-build_main() {
+#
+
+build_ebpfs() {
     if [ ! -d "$BUILD_DIR" ]; then
         mkdir "$BUILD_DIR"
     fi
@@ -67,11 +70,16 @@ build_main() {
     # get all files in the eBPF folder
     EBPF_SOURCE_DIR="$PROJECT_FOLDER/ebpf"
     EBPF_OBJ_DIR="$BUILD_DIR/ebpf"
+    EBPF_CONFIG_DIR="$BUILD_DIR/config"
     EBPF_INCLUDES="-I/usr/include/$ARCH-linux-gnu -I$PROJECT_FOLDER/includes -I$PROJECT_FOLDER/$LIBBPF_BUILD_DIR/include"
     EBPF_FILES=$(find ebpf -name "*.bpf.c" -exec basename {} \;)
 
     if [ ! -d "$EBPF_OBJ_DIR" ]; then
         mkdir "$EBPF_OBJ_DIR"
+    fi
+
+    if [ ! -d "$EBPF_CONFIG_DIR" ]; then
+        mkdir "$EBPF_CONFIG_DIR"
     fi
 
     cd "$EBPF_OBJ_DIR" || exit
@@ -82,14 +90,25 @@ build_main() {
         llvm-strip -g $PROGRAM.bpf.o # remove debug info, not needed for eBPF
     done
     cd "$PROJECT_FOLDER" || exit
+}
+
+build_main() {
+    if [ ! -d "$BUILD_DIR" ]; then
+        mkdir "$BUILD_DIR"
+    fi
 
     ### Build main program
     INCLUDES="-I$PROJECT_FOLDER/$LIBBPF_BUILD_DIR/include -I$PROJECT_FOLDER/includes"
+    CFILES="$PROJECT_FOLDER/cJSON/cJSON.c $PROJECT_FOLDER/base64/base64.c"
     LIBS_DIR="$PROJECT_FOLDER/$LIBBPF_BUILD_DIR/lib64"
-
+    DEFINES="-DDEBUG=1 -DTABLE_PRINTOUT=1"
+    
     echo "Building main program"
     cd "$BUILD_DIR" || exit
-    $CC $CFLAGS ../main.c $INCLUDES -L$LIBS_DIR -lbpf -lelf -lz -o main
+    #$CC $CFLAGS ../main.c $INCLUDES -L$LIBS_DIR -lbpf -lelf -lz -o main
+    #temp without optimization
+    $CC -g $CFILES ../main.c $INCLUDES -L$LIBS_DIR -lbpf -lelf -lz $DEFINES -o main
+    mv main $PROJECT_FOLDER/main
     cd "$PROJECT_FOLDER" || exit
     echo "Done"
 }
@@ -128,6 +147,7 @@ clean_deps() {
 echo "Running command: $COMMAND"
 case $COMMAND in
     main)
+        build_ebpfs
         build_main
         ;;
     deps)
@@ -140,12 +160,18 @@ case $COMMAND in
         clean_deps
         ;;
     all)
-        build_main
         build_deps
+        build_main
         ;;
     clean-all)
         clean_main
         clean_deps
+        ;;
+    ebpfs)
+        build_ebpfs
+        ;;
+    only-main)
+        build_main
         ;;
     *)
         echo "Invalid command: $1"
