@@ -98,14 +98,13 @@ build_main() {
     fi
 
     ### Build main program
-    INCLUDES="-I$PROJECT_FOLDER/$LIBBPF_BUILD_DIR/include -I$PROJECT_FOLDER/includes"
-    CFILES="$PROJECT_FOLDER/cJSON/cJSON.c $PROJECT_FOLDER/base64/base64.c"
+    INCLUDES="-I$PROJECT_FOLDER/$LIBBPF_BUILD_DIR/include -I$PROJECT_FOLDER/includes -I$PROJECT_FOLDER/deps"
     LIBS_DIR="$PROJECT_FOLDER/$LIBBPF_BUILD_DIR/lib64"
     DEFINES="-DDEBUG=1 -DTABLE_PRINTOUT=1"
     
     echo "Building main program"
     cd "$BUILD_DIR" || exit
-    $CC $CFLAGS $CFILES ../main.c $INCLUDES -L$LIBS_DIR -lbpf -lelf -lz $DEFINES -o main
+    $CC $CFLAGS ../main.c $INCLUDES -L$LIBS_DIR -lbpf -lelf -lz $DEFINES -o main
     mv main $PROJECT_FOLDER/main
     cd "$PROJECT_FOLDER" || exit
     echo "Done"

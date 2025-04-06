@@ -5,15 +5,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/inotify.h>
 #include <pthread.h>
 #include <dirent.h>
 
 #include <bpf/libbpf.h>
 
-#include "uthash.h"
-#include "base64.h"
-#include "cJSON.h"
+//dependency includes headers
+#include <uthash/uthash.h>
+#include <base64/base64.h>
+#include <cJSON/cJSON.h>
+
+//dependency includes implementations
+#include <base64/base64.c>
+#include <cJSON/cJSON.c>
 
 typedef uint16_t u16;
 typedef uint32_t u32;
@@ -77,7 +83,6 @@ typedef struct thread_params thread_params;
 struct thread_params {
     hash_record **ebpf_programs_map;
     char *ebpf_programs_dir;
-    int *keep_going;
 };
 
 ////////////////////////////////////////
@@ -88,7 +93,6 @@ struct bpf_map *maps[MAX_MAPS];
 struct bpf_program *progs[MAX_PROGS];
 struct bpf_link *links[MAX_PROGS];
 static bool g_run = true;
-static int keep_going = 1;
 pthread_t tid;
 pthread_mutex_t hash_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -336,6 +340,7 @@ static ebpf_program* load_ebpf_program(char *filename) {
         return NULL;
     }
 
+    // maps population
 
     #ifdef DEBUG
     printf("[DEBUG] (%s) program opened and loaded!\n", ebpf_prog_data->name);
@@ -416,16 +421,6 @@ static void *directory_monitor(void *args) {
     struct inotify_event *event;
     thread_params *t_params = (thread_params*) args; 
 
-    // ------ SIGNAL HANDLING SECTION ------
-
-    // mask SIGINT so the main thread will handle it    
-    sigset_t set;
-    sigemptyset(&set);
-    sigaddset(&set, SIGINT);
-    pthread_sigmask(SIG_BLOCK, &set, NULL);
-
-    // ------ END OF SIGNAL HANDLING SECTION ------
-
     chdir(t_params->ebpf_programs_dir); // move to compiled ebpf programs dir 
 
     populate_hashmap_with_files_in_dir(t_params->ebpf_programs_map, ".", NAMING_CONVENTION);
@@ -445,13 +440,19 @@ static void *directory_monitor(void *args) {
         exit(EXIT_FAILURE);
     }
 
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+
     printf("[INFO - child] Watching for changes in current directory (%s)...\n", t_params->ebpf_programs_dir);
 
-    while (*(t_params->keep_going)) {
+    while (g_run) {
         
         // read events
         bytes_read = read(fd, buffer, sizeof(buffer)); // read a chunk of events
         if (bytes_read == -1) {
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                usleep(10 * 1000);
+                continue;
+            }
             if (errno != EINTR) { // if it's EINTR it's not a problem
                 perror("[ERROR - child] Problems while performing event read from buffer");
                 exit(EXIT_FAILURE);
@@ -557,7 +558,6 @@ void
 sig_int(int signo)
 {
     fprintf(stderr, "[info] signal %d received\n", signo);
-    pthread_kill(tid, SIGTERM);
     g_run = false;
 }
 
@@ -580,7 +580,6 @@ main(int argc, char *argv[])
     thread_params thread_params = {
         .ebpf_programs_map = &ebpf_progs_map,
         .ebpf_programs_dir = ebpf_programs_dir,
-        .keep_going = &keep_going,
     };
 
     int res = pthread_create(&tid, NULL, directory_monitor, &thread_params);
@@ -598,6 +597,9 @@ main(int argc, char *argv[])
 
         sleep(1);
     }
+
+    printf("[INFO] Waiting for the thread...\n");
+    pthread_join(tid, NULL);
 
     return EXIT_SUCCESS;
 }
