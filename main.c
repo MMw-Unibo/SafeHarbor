@@ -30,6 +30,7 @@ typedef uint64_t u64;
 
 #define MAX_PROGS 8
 #define MAX_MAPS 8
+#define MAX_ENTRIES 25
 
 #define DEFAULT_EBPF_PROGRAMS_DIR "./build/config"
 #define NAMING_CONVENTION ".json"
@@ -43,11 +44,60 @@ typedef uint64_t u64;
 #define BUFFER_SIZE EVENT_HEADER_SIZE * NUM_EVENTS
 
 ////////////////////////////////////////
+// enums
+
+typedef enum {
+    EBPF_MAP_VALUE_TYPE_INT,
+    EBPF_MAP_VALUE_TYPE_U32,
+    EBPF_MAP_VALUE_TYPE_CSTRING,
+} ebpf_map_value_type;
+
+typedef enum {
+    EBPF_MAP_DATA_TYPE_HASH,
+    EBPF_MAP_DATA_TYPE_ARRAY,
+} ebpf_map_data_type;
+
+////////////////////////////////////////
 // structs
+
+typedef struct ebpf_hash_map_data ebpf_hash_map_data;
+struct ebpf_hash_map_data {
+    ebpf_map_value_type key_type;
+    ebpf_map_value_type value_type;
+    int key_size;   // size of the single key
+    int value_size; // size of the single value
+    void *keys[MAX_ENTRIES];
+    void *values[MAX_ENTRIES];
+};
+
+typedef struct ebpf_array_map_data ebpf_array_map_data;
+struct ebpf_array_map_data {
+    ebpf_map_value_type value_type;
+    int value_size; // size of the single value
+    void *values[MAX_ENTRIES];
+};
+
+#define param_get_key_hash_map(map, index, type)  ((type)((map)->keys[index]))
+#define param_set_key_hash_map(map, index, value)  (((map)->keys[index] = (void*)(long long)value))
+#define param_get_value_map(map, index, type)  ((type)((map)->values[index]))
+#define param_set_value_map(map, index, value)  (((map)->values[index] = (void*)(long long)value))
+
+typedef struct ebpf_map_data ebpf_map_data; 
+struct ebpf_map_data 
+{
+    ebpf_map_data_type type;
+    union {
+        ebpf_hash_map_data *ebpf_hash_data;
+        ebpf_array_map_data *ebpf_array_data;        
+    };
+};
+
 typedef struct ebpf_params ebpf_params;
 struct ebpf_params {
     char *maps[MAX_MAPS];
     size_t map_count;
+    ebpf_map_data maps_data[MAX_MAPS];
+    size_t entries_count[MAX_MAPS];
     char *progs[MAX_PROGS];
     size_t prog_count;
     unsigned char *elf_data;
@@ -186,6 +236,35 @@ ebpf_params_destroy(ebpf_params *params)
         free(params->progs[i]);
     }
 
+    for(size_t i = 0; i < params->map_count; i++) {
+        switch (params->maps_data[i].type) {
+        case EBPF_MAP_DATA_TYPE_HASH:
+            if(params->maps_data[i].ebpf_hash_data->key_type == EBPF_MAP_VALUE_TYPE_CSTRING) {
+                for (size_t j = 0; j < params->entries_count[i]; j++) {
+                    free((params->maps_data[i].ebpf_hash_data->keys[j]));
+                }
+            }
+
+            if(params->maps_data[i].ebpf_hash_data->value_type == EBPF_MAP_VALUE_TYPE_CSTRING) {
+                for (size_t j = 0; j < params->entries_count[i]; j++) {
+                    free(params->maps_data[i].ebpf_hash_data->values[j]);
+                }
+            }
+            
+            free(params->maps_data[i].ebpf_hash_data);
+            break;
+        case EBPF_MAP_DATA_TYPE_ARRAY:
+            if(params->maps_data[i].ebpf_array_data->value_type == EBPF_MAP_VALUE_TYPE_CSTRING) {
+                for (size_t j = 0; j < params->entries_count[i]; j++) {
+                    free(params->maps_data[i].ebpf_array_data->values[j]);
+                }
+            }
+            
+            free(params->maps_data[i].ebpf_array_data);
+            break;
+        }
+    }
+
     free(params->elf_data);
 
     free(params);
@@ -204,7 +283,8 @@ hash_record_destroy(hash_record **table_head, hash_record *hr)
     free(hr);
 }
 
-static struct bpf_map *
+// unused
+/*static struct bpf_map *
 ebpf_program_find_map_by_name(ebpf_program *prog, const char *name)
 {
     for (size_t i = 0; i < prog->map_count; ++i) {
@@ -214,7 +294,7 @@ ebpf_program_find_map_by_name(ebpf_program *prog, const char *name)
     }
 
     return NULL;
-}
+}*/
 
 ////////////////////////////////////////
 // functions
@@ -234,10 +314,6 @@ static void print_all_map_elements(hash_record *map_head) {
     printf("\n");
 }
 
-static void print_prog_name(hash_record *hr) {
-    printf("prog->name: %s\n", hr->value->name);
-}
-
 static int string_ends_with(char *string, char *suffix) {
     int string_len = strlen(string);
     int suffix_len = strlen(suffix);
@@ -250,61 +326,403 @@ static int string_ends_with(char *string, char *suffix) {
 }
 
 static ebpf_params* read_params_from_file(char *filename) {
-    ebpf_params *params = (ebpf_params*)calloc(1, sizeof(ebpf_params));
     
-    long file_len;
+    ebpf_params *params = (ebpf_params*)calloc(1, sizeof(ebpf_params));
+
+    unsigned long file_len;
     FILE *json_file = fopen(filename, "r");
     fseek(json_file, 0, SEEK_END);
     file_len = ftell(json_file);
     rewind(json_file);
-    char *json_content = (char*)calloc(file_len + 1, sizeof(char)); // a bit spooky since the file could be arbitrarily big
+    char *json_content = (char*)calloc(file_len + 1, sizeof(char));
+    if(json_content == NULL) {
+        perror("[ERROR] error while allocating memory\n");
+        exit(EXIT_FAILURE);
+    }
     if(fread(json_content, sizeof(char), file_len, json_file) != file_len) {
-        perror("[ERROR] error while reading json file");
+        perror("[ERROR] error while reading json file\n");
+        exit(EXIT_FAILURE);
     }
     fclose(json_file);
 
     cJSON *parsed = cJSON_Parse(json_content);
     if (parsed) {
-        int i;
-        char *tmp;
+        size_t i, j;
+        char *tmp_str;
+        cJSON *tmp_json;
 
         cJSON *maps = cJSON_GetObjectItem(parsed, "maps");
         cJSON *progs = cJSON_GetObjectItem(parsed, "progs");
+
+        if(!cJSON_IsArray(maps) || !cJSON_IsArray(progs)) {
+            fprintf(stderr, "[ERROR] Fields \"maps\" and \"progs\" should be JSON arrays\n");
+            fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+            exit(EXIT_FAILURE);
+        }
 
         params->map_count = cJSON_GetArraySize(maps);
         params->prog_count = cJSON_GetArraySize(progs);
 
         if(params->map_count > MAX_MAPS || params->prog_count > MAX_PROGS) {
-            printf("Max maps: %d, provided maps in config file: %zu\n", MAX_MAPS, params->map_count);
-            printf("Max progs: %d, provided programs in config file: %zu\n", MAX_PROGS, params->prog_count);
-            printf("Required fix of config file %s", filename);
+            fprintf(stderr, "[ERROR] Max maps: %d, provided maps in config file: %zu\n", MAX_MAPS, params->map_count);
+            fprintf(stderr, "[ERROR] Max progs: %d, provided programs in config file: %zu\n", MAX_PROGS, params->prog_count);
+            fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
             exit(EXIT_FAILURE);
         }
 
         for (i = 0; i < params->map_count; i++) {
             params->maps[i] = (char*)calloc(MAP_NAME_MAX_LEN, sizeof(char));
-            tmp = cJSON_GetStringValue(cJSON_GetArrayItem(maps, i));
-            strncpy(params->maps[i], tmp, strlen(tmp));
+
+            // populate name field
+            tmp_json = cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "name");
+
+            if(!cJSON_IsString(tmp_json) || (tmp_json->valuestring == NULL)) {
+                fprintf(stderr, "[ERROR] Malformed \"name\" value in map %zu\n", i);
+                fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                exit(EXIT_FAILURE);
+            }
+            tmp_str = cJSON_GetStringValue(tmp_json);
+            
+            strncpy(params->maps[i], tmp_str, strlen(tmp_str));
+
+            // populate maps_type field
+            tmp_json = cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "map_type");
+
+            if(!cJSON_IsString(tmp_json) || (tmp_json->valuestring == NULL)) {
+                fprintf(stderr, "[ERROR] Malformed \"map_type\" value in map %zu\n", i);
+                fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                exit(EXIT_FAILURE);
+            }
+
+            tmp_str = cJSON_GetStringValue(tmp_json);
+            if(strcmp(tmp_str, "hash") == 0) {
+                params->maps_data[i].type = EBPF_MAP_DATA_TYPE_HASH;
+            } else if(strcmp(tmp_str, "array") == 0){
+                params->maps_data[i].type = EBPF_MAP_DATA_TYPE_ARRAY;
+            } else {
+                fprintf(stderr, "[ERROR] Wrong \"map_type\" in map %zu: %s\n", i, tmp_str);
+                fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                exit(EXIT_FAILURE);
+            }
+            
+            // populate maps_data field
+            switch(params->maps_data[i].type) {
+                case EBPF_MAP_DATA_TYPE_HASH:
+                    params->maps_data[i].ebpf_hash_data = (ebpf_hash_map_data*)calloc(1, sizeof(ebpf_hash_map_data));
+
+                    // key type
+                    tmp_json = cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "key_type");
+
+                    if(!cJSON_IsString(tmp_json) || (tmp_json->valuestring == NULL)) {
+                        fprintf(stderr, "[ERROR] Malformed \"key_type\" value in map %zu\n", i);
+                        fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                        exit(EXIT_FAILURE);
+                    }
+
+                    tmp_str = cJSON_GetStringValue(tmp_json);
+                    if(strcmp(tmp_str, "int") == 0) {
+                        params->maps_data[i].ebpf_hash_data->key_type = EBPF_MAP_VALUE_TYPE_INT;
+                    } else if(strcmp(tmp_str, "u32") == 0) {
+                        params->maps_data[i].ebpf_hash_data->key_type = EBPF_MAP_VALUE_TYPE_U32;
+                    } else if (strcmp(tmp_str, "cstring") == 0) {
+                        params->maps_data[i].ebpf_hash_data->key_type = EBPF_MAP_VALUE_TYPE_CSTRING;
+                    } else {
+                        fprintf(stderr, "[ERROR] Wrong \"key_type\" in map %zu: %s\n", i, tmp_str);
+                        fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                        exit(EXIT_FAILURE);
+                    }
+
+                    // value type
+                    tmp_json = cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "value_type");
+
+                    if(!cJSON_IsString(tmp_json) || (tmp_json->valuestring == NULL)) {
+                        fprintf(stderr, "[ERROR] Malformed \"value_type\" value in map %zu\n", i);
+                        fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                        exit(EXIT_FAILURE);
+                    }
+
+                    tmp_str = cJSON_GetStringValue(tmp_json);
+                    if(strcmp(tmp_str, "int") == 0) {
+                        params->maps_data[i].ebpf_hash_data->value_type = EBPF_MAP_VALUE_TYPE_INT;
+                    } else if(strcmp(tmp_str, "u32") == 0) {
+                        params->maps_data[i].ebpf_hash_data->value_type = EBPF_MAP_VALUE_TYPE_U32;
+                    } else if (strcmp(tmp_str, "cstring") == 0) {
+                        params->maps_data[i].ebpf_hash_data->value_type = EBPF_MAP_VALUE_TYPE_CSTRING;
+                    } else {
+                        fprintf(stderr, "[ERROR] Wrong \"value_type\" in map %zu: %s\n", i, tmp_str);
+                        fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                        exit(EXIT_FAILURE);
+                    }
+
+                    tmp_json = cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "keys");
+
+                    if(!cJSON_IsArray(tmp_json)) {
+                        fprintf(stderr, "[ERROR] Field \"keys\" should be an array\n");
+                        fprintf(stderr, "[ERROR] Malformed \"keys\" field in map %zu\n", i);
+                        fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                        exit(EXIT_FAILURE);
+                    }
+
+                    params->entries_count[i] = cJSON_GetArraySize(tmp_json);
+
+                    // populate key params
+                    switch(params->maps_data[i].ebpf_hash_data->key_type){
+                        case EBPF_MAP_VALUE_TYPE_INT:
+                            for(j = 0; j < params->entries_count[i]; j++) {
+                                tmp_json = cJSON_GetArrayItem(cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "keys"), j);
+
+                                if(!cJSON_IsNumber(tmp_json)) {
+                                    fprintf(stderr, "[ERROR] Field \"keys\"[%zu] should be a number\n", j);
+                                    fprintf(stderr, "[ERROR] Malformed \"keys\" field in map %zu\n", i);
+                                    fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                                    exit(EXIT_FAILURE);
+                                }
+
+                                param_set_key_hash_map(params->maps_data[i].ebpf_hash_data, j, (int)cJSON_GetNumberValue(tmp_json));
+                                params->maps_data[i].ebpf_hash_data->key_size = sizeof(int);
+                            }
+                            break;
+                        case EBPF_MAP_VALUE_TYPE_U32:
+                            for(j = 0; j < params->entries_count[i]; j++) {
+                                tmp_json = cJSON_GetArrayItem(cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "keys"), j);
+
+                                if(!cJSON_IsNumber(tmp_json)) {
+                                    fprintf(stderr, "[ERROR] Field \"keys\"[%zu] should be a number\n", j);
+                                    fprintf(stderr, "[ERROR] Malformed \"keys\" field in map %zu\n", i);
+                                    fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                                    exit(EXIT_FAILURE);
+                                }
+
+                                param_set_key_hash_map(params->maps_data[i].ebpf_hash_data, j, (uint32_t)cJSON_GetNumberValue(tmp_json));
+                                params->maps_data[i].ebpf_hash_data->key_size = sizeof(uint32_t);
+                            }
+                            break;
+                        case EBPF_MAP_VALUE_TYPE_CSTRING:
+                            for(j = 0; j < params->entries_count[i]; j++) {
+                                tmp_json = cJSON_GetArrayItem(cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "keys"), j);
+
+                                if(!cJSON_IsString(tmp_json) || (tmp_json->valuestring == NULL)) {
+                                    fprintf(stderr, "[ERROR] Field \"keys\"[%zu] should be a cstring\n", j);
+                                    fprintf(stderr, "[ERROR] Malformed \"keys\" field in map %zu\n", i);
+                                    fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                                    exit(EXIT_FAILURE);
+                                }
+
+                                tmp_str = cJSON_GetStringValue(tmp_json);
+                                tmp_json = cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "key_size");
+
+                                if(!cJSON_IsNumber(tmp_json)) {
+                                    fprintf(stderr, "[ERROR] Field \"key_size\" should be a number\n");
+                                    fprintf(stderr, "[ERROR] Malformed \"key_size\" field in map %zu\n", i);
+                                    fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                                    exit(EXIT_FAILURE);
+                                }
+
+                                params->maps_data[i].ebpf_hash_data->key_size = (int)cJSON_GetNumberValue(tmp_json);
+
+                                param_set_key_hash_map(params->maps_data[i].ebpf_hash_data, j, calloc(params->maps_data[i].ebpf_hash_data->key_size, sizeof(char)));
+                                strncpy(params->maps_data[i].ebpf_hash_data->keys[j], tmp_str, params->maps_data[i].ebpf_hash_data->key_size);
+                            }
+                            break;
+                    } // end switch on params->maps_data[i].ebpf_hash_data->key_type
+
+                    // populate value params
+                    switch(params->maps_data[i].ebpf_hash_data->value_type){
+                        case EBPF_MAP_VALUE_TYPE_INT:
+                            for(j = 0; j < params->entries_count[i]; j++) {
+                                tmp_json = cJSON_GetArrayItem(cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "values"), j);
+
+                                if(!cJSON_IsNumber(tmp_json)) {
+                                    fprintf(stderr, "[ERROR] Field \"values\"[%zu] should be a number\n", j);
+                                    fprintf(stderr, "[ERROR] Malformed \"values\" field in map %zu\n", i);
+                                    fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                                    exit(EXIT_FAILURE);
+                                }
+
+                                param_set_value_map(params->maps_data[i].ebpf_hash_data, j, (int)cJSON_GetNumberValue(tmp_json));
+                                params->maps_data[i].ebpf_hash_data->value_size = sizeof(int);
+                            }
+                            break;
+                        case EBPF_MAP_VALUE_TYPE_U32:
+                            for(j = 0; j < params->entries_count[i]; j++) {
+                                tmp_json = cJSON_GetArrayItem(cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "values"), j);
+
+                                if(!cJSON_IsNumber(tmp_json)) {
+                                    fprintf(stderr, "[ERROR] Field \"values\"[%zu] should be a number\n", j);
+                                    fprintf(stderr, "[ERROR] Malformed \"values\" field in map %zu\n", i);
+                                    fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                                    exit(EXIT_FAILURE);
+                                }
+
+                                param_set_value_map(params->maps_data[i].ebpf_hash_data, j, (uint32_t)cJSON_GetNumberValue(tmp_json));
+                                params->maps_data[i].ebpf_hash_data->value_size = sizeof(uint32_t);
+                            }
+                            break;
+                        case EBPF_MAP_VALUE_TYPE_CSTRING:
+                            for(j = 0; j < params->entries_count[i]; j++) {
+                                tmp_json = cJSON_GetArrayItem(cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "values"), j);
+
+                                if(!cJSON_IsString(tmp_json) || (tmp_json->valuestring == NULL)) {
+                                    fprintf(stderr, "[ERROR] Field \"values\"[%zu] should be a cstring\n", j);
+                                    fprintf(stderr, "[ERROR] Malformed \"values\" field in map %zu\n", i);
+                                    fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                                    exit(EXIT_FAILURE);
+                                }
+
+                                tmp_str = cJSON_GetStringValue(tmp_json);
+                                tmp_json = cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "value_size");
+
+                                if(!cJSON_IsNumber(tmp_json)) {
+                                    fprintf(stderr, "[ERROR] Field \"value_size\" should be a number\n");
+                                    fprintf(stderr, "[ERROR] Malformed \"value_size\" field in map %zu\n", i);
+                                    fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                                    exit(EXIT_FAILURE);
+                                }
+
+                                params->maps_data[i].ebpf_hash_data->value_size = (int)cJSON_GetNumberValue(tmp_json);
+
+                                param_set_value_map(params->maps_data[i].ebpf_hash_data, j, calloc(params->maps_data[i].ebpf_hash_data->value_size, sizeof(char)));
+                                strncpy(params->maps_data[i].ebpf_hash_data->values[j], tmp_str, params->maps_data[i].ebpf_hash_data->value_size);
+                            }
+                            break;
+                    } // end switch on params->maps_data[i].ebpf_hash_data->value_type
+                    break;
+
+                case EBPF_MAP_DATA_TYPE_ARRAY:
+                    params->maps_data[i].ebpf_array_data = (ebpf_array_map_data*)calloc(1, sizeof(ebpf_array_map_data));
+
+                    // value type
+                    tmp_json = cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "value_type");
+
+                    if(!cJSON_IsString(tmp_json) || (tmp_json->valuestring == NULL)) {
+                        fprintf(stderr, "[ERROR] Malformed \"value_type\" value in map %zu\n", i);
+                        fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                        exit(EXIT_FAILURE);
+                    }
+
+                    tmp_str = cJSON_GetStringValue(tmp_json);
+                    if(strcmp(tmp_str, "int") == 0) {
+                        params->maps_data[i].ebpf_array_data->value_type = EBPF_MAP_VALUE_TYPE_INT;
+                    } else if(strcmp(tmp_str, "u32") == 0) {
+                        params->maps_data[i].ebpf_array_data->value_type = EBPF_MAP_VALUE_TYPE_U32;
+                    } else if (strcmp(tmp_str, "cstring") == 0) {
+                        params->maps_data[i].ebpf_array_data->value_type = EBPF_MAP_VALUE_TYPE_CSTRING;
+                    } else {
+                        fprintf(stderr, "[ERROR] Wrong \"value_type\" in map %zu: %s\n", i, tmp_str);
+                        fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                        exit(EXIT_FAILURE);
+                    }
+
+                    tmp_json = cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "values");
+
+                    if(!cJSON_IsArray(tmp_json)) {
+                        fprintf(stderr, "[ERROR] Field \"values\" should be an array\n");
+                        fprintf(stderr, "[ERROR] Malformed \"values\" field in map %zu\n", i);
+                        fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                        exit(EXIT_FAILURE);
+                    }
+
+                    params->entries_count[i] = cJSON_GetArraySize(tmp_json);
+                    
+                    switch(params->maps_data[i].ebpf_array_data->value_type){
+                        case EBPF_MAP_VALUE_TYPE_INT:
+                            for(j = 0; j < params->entries_count[i]; j++) {
+                                tmp_json = cJSON_GetArrayItem(cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "values"), j);
+
+                                if(!cJSON_IsNumber(tmp_json)) {
+                                    fprintf(stderr, "[ERROR] Field \"values\"[%zu] should be a number\n", j);
+                                    fprintf(stderr, "[ERROR] Malformed \"values\" field in map %zu\n", i);
+                                    fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                                    exit(EXIT_FAILURE);
+                                }
+
+                                param_set_value_map(params->maps_data[i].ebpf_array_data, j, (int)cJSON_GetNumberValue(tmp_json));
+                                params->maps_data[i].ebpf_array_data->value_size = sizeof(int);
+                            }
+                            break;
+                        case EBPF_MAP_VALUE_TYPE_U32:
+                            for(j = 0; j < params->entries_count[i]; j++) {
+                                tmp_json = cJSON_GetArrayItem(cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "values"), j);
+
+                                if(!cJSON_IsNumber(tmp_json)) {
+                                    fprintf(stderr, "[ERROR] Field \"values\"[%zu] should be a number\n", j);
+                                    fprintf(stderr, "[ERROR] Malformed \"values\" field in map %zu\n", i);
+                                    fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                                    exit(EXIT_FAILURE);
+                                }
+                                param_set_value_map(params->maps_data[i].ebpf_array_data, j, (uint32_t)cJSON_GetNumberValue(tmp_json));
+                                params->maps_data[i].ebpf_array_data->value_size = sizeof(uint32_t);
+                            }
+                            break;
+                        case EBPF_MAP_VALUE_TYPE_CSTRING:
+                            for(j = 0; j < params->entries_count[i]; j++) {
+                                tmp_json = cJSON_GetArrayItem(cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "values"), j);
+
+                                if(!cJSON_IsString(tmp_json) || (tmp_json->valuestring == NULL)) {
+                                    fprintf(stderr, "[ERROR] Field \"values\"[%zu] should be a cstring\n", j);
+                                    fprintf(stderr, "[ERROR] Malformed \"values\" field in map %zu\n", i);
+                                    fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                                    exit(EXIT_FAILURE);
+                                }
+
+                                tmp_str = cJSON_GetStringValue(tmp_json);
+                                tmp_json = cJSON_GetObjectItem((cJSON_GetArrayItem(maps, i)), "value_size");
+
+                                if(!cJSON_IsNumber(tmp_json)) {
+                                    fprintf(stderr, "[ERROR] Field \"value_size\" should be a number\n");
+                                    fprintf(stderr, "[ERROR] Malformed \"value_size\" field in map %zu\n", i);
+                                    fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                                    exit(EXIT_FAILURE);
+                                }
+                                
+                                params->maps_data[i].ebpf_array_data->value_size = (int)cJSON_GetNumberValue(tmp_json);
+                                param_set_value_map(params->maps_data[i].ebpf_array_data, j, calloc(params->maps_data[i].ebpf_array_data->value_size, sizeof(char)));
+                                strncpy(params->maps_data[i].ebpf_array_data->values[j], tmp_str, params->maps_data[i].ebpf_array_data->value_size);
+                            }
+                            break;
+                    } // end switch on params->maps_data[i].ebpf_array_data->value_type      
+                    
+                    break;
+            } // end switch on params->maps_data[i].type
+            
         }
 
         for (i = 0; i < params->prog_count; i++) {
             params->progs[i] = (char*)calloc(PROG_NAME_MAX_LEN, sizeof(char));
-            tmp = cJSON_GetStringValue(cJSON_GetArrayItem(progs, i));
-            strncpy(params->progs[i], tmp, strlen(tmp));
+            tmp_json = cJSON_GetArrayItem(progs, i);
+
+            if(!cJSON_IsString(tmp_json) || (tmp_json->valuestring == NULL)) {
+                fprintf(stderr, "[ERROR] Field \"progs\"[%zu] should be a string\n", i);
+                fprintf(stderr, "[ERROR] Malformed \"progs\" field\n");
+                fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+                exit(EXIT_FAILURE);
+            }
+
+            tmp_str = cJSON_GetStringValue(tmp_json);
+            strncpy(params->progs[i], tmp_str, strlen(tmp_str));
         }
 
-        char *encoded_ebpf_prog = cJSON_GetStringValue(cJSON_GetObjectItem(parsed, "ebpf_prog"));
+        tmp_json = cJSON_GetObjectItem(parsed, "ebpf_prog");
+
+        if(!cJSON_IsString(tmp_json) || (tmp_json->valuestring == NULL)) {
+            fprintf(stderr, "[ERROR] Field \"ebpf_prog\" should be a string\n");
+            fprintf(stderr, "[ERROR] Malformed \"ebpf_prog\" field\n");
+            fprintf(stderr, "[ERROR] Required fix of config file %s\n", filename);
+            exit(EXIT_FAILURE);
+        }
+
+        char *encoded_ebpf_prog = cJSON_GetStringValue(tmp_json);
         params->elf_data = base64_decode((unsigned char*)encoded_ebpf_prog, strlen(encoded_ebpf_prog), &params->elf_data_size);
         
         cJSON_Delete(parsed);
 
         #ifdef DEBUG
-        for (int i = 0; i < params->map_count; i++) {
-            printf("[DEBUG] Config file %s, found map %d: %s\n", filename, i, params->maps[i]);
+        for (size_t i = 0; i < params->map_count; i++) {
+            printf("[DEBUG] Config file %s, found map %zu: %s\n", filename, i, params->maps[i]);
         }
 
-        for (int i = 0; i < params->prog_count; i++) {
-            printf("[DEBUG] Config file %s, found prog %d: %s\n", filename, i, params->progs[i]);
+        for (size_t i = 0; i < params->prog_count; i++) {
+            printf("[DEBUG] Config file %s, found prog %zu: %s\n", filename, i, params->progs[i]);
         }
         #endif /*DEBUG*/
        
@@ -340,10 +758,55 @@ static ebpf_program* load_ebpf_program(char *filename) {
         return NULL;
     }
 
-    // maps population
-
     #ifdef DEBUG
     printf("[DEBUG] (%s) program opened and loaded!\n", ebpf_prog_data->name);
+    #endif /*DEBUG*/
+
+    int ret_val;
+    void* key, *value;
+    // maps population
+    for(size_t i = 0; i < ebpf_prog_data->map_count; i++) {
+        for(size_t j = 0; j < params->entries_count[i]; j++) {
+            switch(params->maps_data[i].type) {
+                case EBPF_MAP_DATA_TYPE_HASH:
+                    key = calloc(params->maps_data[i].ebpf_hash_data->key_size, 1);
+                    value = calloc(params->maps_data[i].ebpf_hash_data->value_size, 1);
+                    
+                    memcpy(key, params->maps_data[i].ebpf_hash_data->keys[j], params->maps_data[i].ebpf_hash_data->key_size);    
+                    memcpy(value, &params->maps_data[i].ebpf_hash_data->values[j], params->maps_data[i].ebpf_hash_data->value_size);
+                    
+                    ret_val = bpf_map__update_elem(ebpf_prog_data->maps[i].map, key, params->maps_data[i].ebpf_hash_data->key_size, value, params->maps_data[i].ebpf_hash_data->value_size, BPF_ANY);
+                    if (ret_val < 0) {
+                        fprintf(stderr, "[ERROR] While populating map %s (%s)\n", ebpf_prog_data->maps->name,strerror(errno));
+                        exit(EXIT_FAILURE);
+                    }
+
+                    free(key);
+                    free(value);
+
+                    break;
+                case EBPF_MAP_DATA_TYPE_ARRAY:
+                    value = calloc(params->maps_data[i].ebpf_array_data->value_size, 1);
+
+                    memcpy(value, &params->maps_data[i].ebpf_array_data->values[j], params->maps_data[i].ebpf_hash_data->value_size);
+
+                    // keys in array maps are always 4-bytes sized unsigned integers
+                    ret_val = bpf_map__update_elem(ebpf_prog_data->maps[i].map, &i, sizeof(uint32_t), value, params->maps_data[i].ebpf_array_data->value_size, BPF_ANY);
+                    if (ret_val < 0) {
+                        fprintf(stderr, "[ERROR] While populating map %s (%s)\n", ebpf_prog_data->maps->name,strerror(errno));
+                        exit(EXIT_FAILURE);
+                    }
+                    
+                    free(value);
+
+                    break;
+            }
+            
+        }
+    }
+
+    #ifdef DEBUG
+    printf("[DEBUG] (%s) populated all maps!\n", ebpf_prog_data->name);
     #endif /*DEBUG*/
 
     ebpf_params_destroy(params);

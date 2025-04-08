@@ -30,7 +30,7 @@ struct {
 */
 
 SEC("tracepoint/syscalls/sys_enter_openat")
-int openat_armillotta(struct trace_event_raw_sys_enter *ctx)
+int openat_on_tracepoint(struct trace_event_raw_sys_enter *ctx)
 {
     int ret;
     int flag_process=1; //1 vuol dire che il processo corrente non è un processo che puo fare l'azione

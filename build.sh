@@ -39,7 +39,7 @@ fi
 # VARIABLES
 # 
 CC=clang
-CFLAGS="-g -O2"
+CFLAGS="-g -Wall -Wextra" #-O2" # -Wno-int-to-void-pointer-cast"
 PROJECT_FOLDER=$(pwd)
 DEPS_DIR="deps"
 BUILD_DIR="build"

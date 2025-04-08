@@ -97,7 +97,8 @@ unsigned char * base64_decode(const unsigned char *src, int len,
 			      int *out_len)
 {
 	unsigned char dtable[256], *out, *pos, block[4], tmp;
-	int i, count, olen;
+	size_t i; 
+	int count, olen;
 	int pad = 0;
 
 	memset(dtable, 0x80, 256);
@@ -106,7 +107,7 @@ unsigned char * base64_decode(const unsigned char *src, int len,
 	dtable['='] = 0;
 
 	count = 0;
-	for (i = 0; i < len; i++) {
+	for (i = 0; i < (size_t)len; i++) {
 		if (dtable[src[i]] != 0x80)
 			count++;
 	}
@@ -120,7 +121,7 @@ unsigned char * base64_decode(const unsigned char *src, int len,
 		return NULL;
 
 	count = 0;
-	for (i = 0; i < len; i++) {
+	for (i = 0; i < (size_t)len; i++) {
 		tmp = dtable[src[i]];
 		if (tmp == 0x80)
 			continue;
